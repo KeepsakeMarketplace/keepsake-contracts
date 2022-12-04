@@ -1,0 +1,13 @@
+{
+	"individual": {
+		"marketplace_nofee": {
+			"packageObjectId": "0x3fc1b2900999c5d07cf9e237620c622c2a78fa8c",
+			"createdObjects": []
+		}
+	},
+	"NFTs": {
+		"packageObjectId": "0x9394ece3c263b54289fe9bae76f37a5b6b9d6d48",
+		"createdObjects": [],
+		"market": "0xae4e96094385ee299ce3b30ebe6bb63e2b82166a"
+	}
+}
