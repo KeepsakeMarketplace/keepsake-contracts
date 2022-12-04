@@ -7,8 +7,10 @@ To test it:
 2. save the private key, and send some sui to the account address for it.
 3. `npm run deploy` (to launch the contract)
 4. `npm run call create` (to create a shared marketplace object)
+
 To make a listing and then buy it:
 1. `npm run call list` (to mint and list an NFT. Take note of the Listing ID it'll show in the console)
 2. `npm run call buy {listing_object_id}` (subbing in the listing ID for {listing_object_id})
+
 To run an auction:
 1. `npm run call auction` (Currently there's no epochs on devnet, so there are no time limits for an auction.)
