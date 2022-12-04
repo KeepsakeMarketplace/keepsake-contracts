@@ -1,7 +1,7 @@
 {
   "name": "market",
   "version": "1.0.0",
-  "description": "* Num: Issuing the first ten natural numbers as collectible NFT's. * Marketplace: An opensea-like marketplace built with shared objects.",
+  "description": "* meta_nft: NFTs for testing * Marketplace: An opensea-like marketplace built with shared objects.",
   "main": "tests.js",
   "scripts": {
     "deploy": "env-cmd node js/deploy",
