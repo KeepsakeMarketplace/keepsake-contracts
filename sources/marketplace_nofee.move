@@ -2,6 +2,10 @@
 // SPDX-License-Identifier: Apache-2.0
 
 module nfts::marketplace_nofee {
+    use std::type_name;
+    use std::string;
+    use std::ascii;
+
     use sui::tx_context::{Self, TxContext};
     use sui::object::{Self, UID, ID};
     use sui::transfer;
@@ -9,23 +13,37 @@ module nfts::marketplace_nofee {
     use sui::coin::{Self, Coin};
     use sui::balance::{Self, Balance};
 
-    // For when amount paid does not match the expected.
-    const EAmountIncorrect: u64 = 0;
-    // For when someone tries to delist without ownership.
-    const ENotOwner: u64 = 1;
+    use nft_protocol::transfer_allowlist::{Self, Allowlist, CollectionControlCap};
+    use nft_protocol::nft::{Nft};
+    // use nfts::fixed_price::{Self};
+    // use nfts::dutch_auction::{Self};
+    
+    const MaxFee: u16 = 2000; // 20%! Way too high, this is mostly to prevent accidents, like adding an extra 0
 
+    // For when amount paid does not match the expected.
+    const EAmountIncorrect: u64 = 135289670000;
+    // For when someone tries to delist without ownership.
+    const ENotOwner: u64 = 135289670000 + 1;
+    // For when someone tries to use fallback functions for a standardized NFT.
+    const EMustUseStandard: u64 = 135289670000 + 2;
     // For auctions
-    const ETooLate: u64 = 2;
-    const ETooEarly: u64 = 3;
-    const ENoBid: u64 = 4;
+    const ETooLate: u64 = 135289670000 + 100;
+    const ETooEarly: u64 = 135289670000 + 101;
+    const ENoBid: u64 = 135289670000 + 102;
+    
 
     struct Marketplace has key {
         id: UID,
-        fee: u8,
         owner: address,
+        fee: u16,
+        feeReceiver: address,
     }
 
+    struct Witness has drop {}
+
     /// A single listing which contains the listed item and its price in [`Coin<C>`].
+    // Potential improvement: make each listing part of a smaller shared object (e.g. per type, per seller, etc.)
+    // store market details in the listing to prevent any need to interact with the Marketplace shared object?
     struct Listing<T: key + store, phantom C> has key, store {
         id: UID,
         item: T,
@@ -44,22 +62,45 @@ module nfts::marketplace_nofee {
         bidder: address,
     }
 
+    public entry fun updateMarket(marketplace: &mut Marketplace, owner: address, fee: u16, feeReceiver: address, ctx: &mut TxContext) {
+        assert!(tx_context::sender(ctx) == marketplace.owner, ENotOwner);
+        assert!(fee <= MaxFee, EAmountIncorrect);
+        marketplace.fee = fee;
+        marketplace.owner = owner;
+        marketplace.feeReceiver = feeReceiver;
+    }
+
+    // reintroduced deprecated function until I've read through the Pay documentation
     public entry fun split_and_transfer<C>(from: Coin<C>, amount: u64, recipient: address, ctx: &mut TxContext) {
         transfer::transfer(coin::split(&mut from, amount, ctx), recipient);
         transfer::transfer(from, tx_context::sender(ctx))
     }
 
     /// Create a new shared Marketplace.
-    public entry fun create(owner: address, fee: u8, ctx: &mut TxContext) {
+    public entry fun create(owner: address, fee: u16, feeReceiver: address, ctx: &mut TxContext) {
         let id = object::new(ctx);
+        assert!(fee <= MaxFee, EAmountIncorrect);
 
         let market_place = Marketplace {
             id,
-            fee,
             owner,
+            fee,
+            feeReceiver
         };
         transfer::share_object(market_place);
-        // transfer::transfer(market_place, tx_context::sender(ctx));
+        
+        let allowlist = transfer_allowlist::create(Witness {}, ctx);
+        transfer::share_object(allowlist);
+    }
+
+    // managing allowlists so we can properly transfer NFTs
+    public entry fun create_allowlist(ctx: &mut TxContext) {
+        let allowlist = transfer_allowlist::create(Witness {}, ctx);
+        transfer::share_object(allowlist);
+    }
+
+    public entry fun add_to_allowlist<C>(allowlist: &mut Allowlist, collection_auth: &CollectionControlCap<C>) {
+        transfer_allowlist::insert_collection<Witness, C>(Witness {}, collection_auth, allowlist);
     }
 
     /// List an item at the Marketplace.
@@ -69,6 +110,7 @@ module nfts::marketplace_nofee {
         ask: u64,
         ctx: &mut TxContext
     ) {
+
         let id = object::new(ctx);
         let listing = Listing<T, C> {
             id,
@@ -144,7 +186,14 @@ module nfts::marketplace_nofee {
         ctx: &mut TxContext
     ): T {
         let listing = ofield::remove<ID, Listing<T, C>>(&mut _marketplace.id, listing_id);
-        
+
+        // let typeName = & string::utf8(ascii::into_bytes(type_name::into_string(type_name::get<C>())));
+        // // last number can be 51? 32 for address, 4 for seperating colons, 12 for "nft_protocol", 3 for "Nft"
+        // let nftType = & string::sub_string(& string::utf8(ascii::into_bytes(type_name::into_string(type_name::get<Nft<Witness>>()))), 0, 51);
+        // // Returns `length(s)` if no occurrence found. We compare it to 0 because a standard NFT must start with the correct address::module::name
+        // assert!(string::index_of(typeName, nftType) > 0, EMustUseStandard);
+        // nft::change_logical_owner(&mut minted, recipient, KEEPSAKE {}, allowlist);
+
         let Listing { id, item, ask, owner } = listing;
         object::delete(id);
 
@@ -282,6 +331,50 @@ module nfts::marketplace_nofee {
         let listing = ofield::remove<ID, AuctionListing<T, C>>(&mut _marketplace.id, listing_id);
         let item = deauction(_marketplace, listing, ctx);
         transfer::transfer(item, tx_context::sender(ctx));
+    }
+
+    // public entry fun createLaunchpad<T>(
+    //     market: & Marketplace,
+    //     collection_id: ID,
+    //     type: u8,
+    //     prices: vector<u64>,
+    //     whitelist: vector<bool>,
+    //     receiver: address,
+    //     ctx: &mut TxContext
+    // ) {
+    //     assert!(tx_context::sender(ctx) == market.owner, ENotOwner);
+    //     if(type == 0) {
+    //         fixed_price::create_market<T>(
+    //             tx_context::sender(ctx), // admin
+    //             collection_id,
+    //             receiver, // receiver
+    //             true, // is_embedded
+    //             whitelist, prices,
+    //             ctx,
+    //         );
+    //     } else {
+    //         dutch_auction::create_market<T>(
+    //             tx_context::sender(ctx), // admin
+    //             collection_id,
+    //             receiver, // receiver
+    //             true, // is_embedded
+    //             whitelist, prices,
+    //             ctx,
+    //         );
+    //     }
+    // }
+
+    // getter functions for contracts to get info about our marketplace.
+    public fun owner(
+        market: &Marketplace,
+    ): address {
+        market.owner
+    }
+
+    public fun fee(
+        market: &Marketplace,
+    ): u16 {
+        market.fee
     }
 }
 
