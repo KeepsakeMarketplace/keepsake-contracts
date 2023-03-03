@@ -1,11 +1,14 @@
 // Copyright (c) 2022, Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-module nfts::meta_nft {
+module keepsake::meta_nft {
     use std::ascii::{Self, String};
     use sui::object::{Self, UID};
+    use sui::coin::{Coin};
     use sui::transfer;
     use sui::tx_context::{Self, TxContext};
+    use keepsake::marketplace_nofee::{Self, Marketplace};
+    use sui::sui::SUI;
 
     /// Basic NFT
     struct MetaNFT has key, store {
@@ -39,11 +42,13 @@ module nfts::meta_nft {
     }
 
     /// Create a new `MetaNFT` NFT. Aborts if `MAX_SUPPLY` NFT's have already been issued
-    public entry fun mint(cap: &mut MetaNFTIssuerCap,
+    public entry fun mint(
+        cap: &mut MetaNFTIssuerCap,
         name: vector<u8>,
         description: vector<u8>,
         image: vector<u8>,
-        ctx: &mut TxContext) {
+        ctx: &mut TxContext
+    ) {
         let n = cap.issued_counter;
         cap.issued_counter = n + 1;
         cap.supply = cap.supply + 1;
@@ -54,6 +59,52 @@ module nfts::meta_nft {
             url: ascii::string(image)
         };
         transfer::transfer(newNFT, tx_context::sender(ctx))
+    }
+
+    public entry fun mint_and_list(
+        cap: &mut MetaNFTIssuerCap,
+        name: vector<u8>,
+        description: vector<u8>,
+        image: vector<u8>,
+        marketplace: &mut Marketplace,
+        ask: u64,
+        ctx: &mut TxContext
+    ) {
+        let n = cap.issued_counter;
+        cap.issued_counter = n + 1;
+        cap.supply = cap.supply + 1;
+        let newNFT = MetaNFT {
+            id: object::new(ctx),
+            name: ascii::string(name),
+            description: ascii::string(description),
+            url: ascii::string(image)
+        };
+        marketplace_nofee::list<MetaNFT>(marketplace, newNFT, ask, ctx);
+    }
+
+    public entry fun mint_and_auction(
+        cap: &mut MetaNFTIssuerCap,
+        name: vector<u8>,
+        description: vector<u8>,
+        image: vector<u8>,
+        marketplace: &mut Marketplace,
+        min_bid: u64,
+        min_bid_increment: u64,
+        starts: u64,
+        expires: u64,
+        collateral: Coin<SUI>,
+        ctx: &mut TxContext
+    ) {
+        let n = cap.issued_counter;
+        cap.issued_counter = n + 1;
+        cap.supply = cap.supply + 1;
+        let newNFT = MetaNFT {
+            id: object::new(ctx),
+            name: ascii::string(name),
+            description: ascii::string(description),
+            url: ascii::string(image)
+        };
+        marketplace_nofee::auction<MetaNFT>(marketplace, newNFT, min_bid, min_bid_increment, starts, expires, collateral, ctx);
     }
 
     /// Burn `nft`. This reduces the supply.

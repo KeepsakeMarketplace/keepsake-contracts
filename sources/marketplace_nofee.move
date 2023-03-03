@@ -1,22 +1,25 @@
 // Copyright (c) 2022, Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-module nfts::marketplace_nofee {
-    use std::type_name;
-    use std::string;
-    use std::ascii;
-
+module keepsake::marketplace_nofee {
+    use std::type_name::{Self, TypeName};
+    
     use sui::tx_context::{Self, TxContext};
     use sui::object::{Self, UID, ID};
     use sui::transfer;
+    use sui::event;
     use sui::dynamic_object_field as ofield;
     use sui::coin::{Self, Coin};
+    use sui::sui::SUI;
     use sui::balance::{Self, Balance};
 
     use nft_protocol::transfer_allowlist::{Self, Allowlist, CollectionControlCap};
-    use nft_protocol::nft::{Nft};
+    use nft_protocol::nft::{Self, Nft};
+    use nft_protocol::utils::{Self as nft_utils};
     // use nfts::fixed_price::{Self};
     // use nfts::dutch_auction::{Self};
+
+    friend keepsake::lending;
     
     const MaxFee: u16 = 2000; // 20%! Way too high, this is mostly to prevent accidents, like adding an extra 0
 
@@ -26,6 +29,7 @@ module nfts::marketplace_nofee {
     const ENotOwner: u64 = 135289670000 + 1;
     // For when someone tries to use fallback functions for a standardized NFT.
     const EMustUseStandard: u64 = 135289670000 + 2;
+    const EMustNotUseStandard: u64 = 135289670000 + 3;
     // For auctions
     const ETooLate: u64 = 135289670000 + 100;
     const ETooEarly: u64 = 135289670000 + 101;
@@ -36,7 +40,8 @@ module nfts::marketplace_nofee {
         id: UID,
         owner: address,
         fee: u16,
-        feeReceiver: address,
+        feeBalance: Balance<SUI>,
+        collateralFee: u64,
     }
 
     struct Witness has drop {}
@@ -44,166 +49,214 @@ module nfts::marketplace_nofee {
     /// A single listing which contains the listed item and its price in [`Coin<C>`].
     // Potential improvement: make each listing part of a smaller shared object (e.g. per type, per seller, etc.)
     // store market details in the listing to prevent any need to interact with the Marketplace shared object?
-    struct Listing<T: key + store, phantom C> has key, store {
+    struct Listing<T: key + store> has key, store {
         id: UID,
         item: T,
         ask: u64, // Coin<C>
         owner: address,
     }
 
-    struct AuctionListing<T: key + store, phantom C> has key, store {
+    struct AuctionListing<T: key + store> has key, store {
         id: UID,
         item: T,
-        bid: Balance<C>,
+        bid: Balance<SUI>,
+        collateral: Balance<SUI>,
         min_bid: u64,
+        min_bid_increment: u64,
         starts: u64,
         expires: u64,
         owner: address,
         bidder: address,
     }
 
-    public entry fun updateMarket(marketplace: &mut Marketplace, owner: address, fee: u16, feeReceiver: address, ctx: &mut TxContext) {
+    struct WonAuction<T: key> {
+        item: T,
+        bidder: address
+    }
+
+    struct ListNftEvent has copy, drop {
+        /// ID of the `Nft` that was listed
+        nft_id: ID,
+        ask: u64,
+        auction: bool,
+        /// Type name of `Nft<C>` one-time witness `C`
+        /// Intended to allow users to filter by collections of interest.
+        type_name: TypeName,
+    }
+
+    struct DelistNftEvent has copy, drop {
+        /// ID of the `Nft` that was listed
+        nft_id: ID,
+        sale_price: u64,
+        sold: bool,
+        /// Type name of `Nft<C>` one-time witness `C`
+        /// Intended to allow users to filter by collections of interest.
+        type_name: TypeName,
+    }
+
+    /// Create a new shared Marketplace.
+    public entry fun create(
+        owner: address,
+        fee: u16,
+        collateralFee: u64,
+        ctx: &mut TxContext
+    ) {
+        let id = object::new(ctx);
+        assert!(fee <= MaxFee, EAmountIncorrect);
+        // collateral must be even for an even split
+        assert!(collateralFee % 2 == 0, EAmountIncorrect);
+
+        let marketplace = Marketplace {
+            id,
+            owner,
+            fee,
+            feeBalance: balance::zero<SUI>(),
+            collateralFee,
+        };
+        transfer::share_object(marketplace);
+        
+        let allowlist = transfer_allowlist::create<Witness>(& Witness {}, ctx);
+        transfer::share_object(allowlist);
+    }
+
+    public entry fun updateMarket(
+        marketplace: &mut Marketplace,
+        owner: address,
+        fee: u16,
+        ctx: &mut TxContext
+    ) {
         assert!(tx_context::sender(ctx) == marketplace.owner, ENotOwner);
         assert!(fee <= MaxFee, EAmountIncorrect);
         marketplace.fee = fee;
         marketplace.owner = owner;
-        marketplace.feeReceiver = feeReceiver;
     }
 
-    // reintroduced deprecated function until I've read through the Pay documentation
-    public entry fun split_and_transfer<C>(from: Coin<C>, amount: u64, recipient: address, ctx: &mut TxContext) {
-        transfer::transfer(coin::split(&mut from, amount, ctx), recipient);
-        transfer::transfer(from, tx_context::sender(ctx))
-    }
-
-    /// Create a new shared Marketplace.
-    public entry fun create(owner: address, fee: u16, feeReceiver: address, ctx: &mut TxContext) {
-        let id = object::new(ctx);
-        assert!(fee <= MaxFee, EAmountIncorrect);
-
-        let market_place = Marketplace {
-            id,
-            owner,
-            fee,
-            feeReceiver
+    public entry fun withdraw(
+        marketplace: &mut Marketplace,
+        to: address,
+        max: u64,
+        ctx: &mut TxContext
+    ) {
+        assert!(tx_context::sender(ctx) == marketplace.owner, ENotOwner);
+        let balance = sui::balance::value(&marketplace.feeBalance);
+        if(max > balance){
+            balance = max;
         };
-        transfer::share_object(market_place);
-        
-        let allowlist = transfer_allowlist::create(Witness {}, ctx);
-        transfer::share_object(allowlist);
-    }
-
-    // managing allowlists so we can properly transfer NFTs
-    public entry fun create_allowlist(ctx: &mut TxContext) {
-        let allowlist = transfer_allowlist::create(Witness {}, ctx);
-        transfer::share_object(allowlist);
+        let newCoin = coin::take(&mut marketplace.feeBalance, balance, ctx);
+        transfer::transfer(newCoin, to);
     }
 
     public entry fun add_to_allowlist<C>(allowlist: &mut Allowlist, collection_auth: &CollectionControlCap<C>) {
-        transfer_allowlist::insert_collection<Witness, C>(Witness {}, collection_auth, allowlist);
+        transfer_allowlist::insert_collection_with_cap<C, Witness>(& Witness {}, collection_auth, allowlist);
     }
 
     /// List an item at the Marketplace.
-    public entry fun list<T: key + store, C>(
-        _marketplace: &mut Marketplace,
+    public entry fun list<T: key + store>(
+        marketplace: &mut Marketplace,
         item: T,
         ask: u64,
         ctx: &mut TxContext
     ) {
-
-        let id = object::new(ctx);
-        let listing = Listing<T, C> {
-            id,
-            item,
-            ask,
-            owner: tx_context::sender(ctx),
-        };
-        let id = object::id(&listing); 
-        ofield::add(&mut _marketplace.id, id, listing);
+        list_and_get_id(marketplace, item, ask, ctx);
     }
 
-    public fun sclist<T: key + store, C>(
-        _marketplace: &mut Marketplace,
+    public fun list_and_get_id<T: key + store>(
+        marketplace: &mut Marketplace,
         item: T,
         ask: u64,
         ctx: &mut TxContext
     ): ID {
+        event::emit(ListNftEvent {
+            nft_id: object::id(&item),
+            ask,
+            auction: false,
+            type_name: type_name::get<T>(),
+        });
         let id = object::new(ctx);
-        let listing = Listing<T, C> {
+        let listing = Listing<T> {
             id,
             item,
             ask,
             owner: tx_context::sender(ctx),
         };
         let id = object::id(&listing); 
-        ofield::add(&mut _marketplace.id, id, listing);
+        ofield::add(&mut marketplace.id, id, listing);
         id
     }
     
-    public fun adjust_listing<T: key + store, C>(
-        _marketplace: &mut Marketplace,
+    public fun adjust_listing<T: key + store>(
+        marketplace: &mut Marketplace,
         listing_id: ID,
         ask: u64,
         ctx: &mut TxContext
     ) {
-        let listing = ofield::borrow_mut<ID, Listing<T, C>>(&mut _marketplace.id, listing_id);
+        let listing = ofield::borrow_mut<ID, Listing<T>>(&mut marketplace.id, listing_id);
         listing.ask = ask;
         assert!(tx_context::sender(ctx) == listing.owner, ENotOwner);
     }
 
     /// Remove listing and get an item back. Only owner can do that.
-    public fun delist<T: key + store, C>(
-        _marketplace: &mut Marketplace,
+    public fun delist<T: key + store>(
+        marketplace: &mut Marketplace,
         listing_id: ID,
         ctx: &mut TxContext
     ): T {
-        let listing = ofield::remove<ID, Listing<T, C>>(&mut _marketplace.id, listing_id);
+        let listing = ofield::remove<ID, Listing<T>>(&mut marketplace.id, listing_id);
         let Listing { id, item, ask: _, owner } = listing;
         object::delete(id);
 
         assert!(tx_context::sender(ctx) == owner, ENotOwner);
 
+        event::emit(DelistNftEvent {
+            nft_id: object::id(&item),
+            sale_price: 0,
+            sold: false,
+            type_name: type_name::get<T>(),
+        });
+
         item
     }
 
     /// Call [`delist`] and transfer item to the sender.
-    public entry fun delist_and_take<T: key + store, C>(
-        _marketplace: &mut Marketplace,
+    public entry fun delist_and_take<T: key + store>(
+        marketplace: &mut Marketplace,
         listing_id: ID,
         ctx: &mut TxContext
     ) {
-        let item = delist<T, C>(_marketplace, listing_id, ctx);
+        let item = delist<T>(marketplace, listing_id, ctx);
         transfer::transfer(item, tx_context::sender(ctx));
     }
 
-    /// Purchase an item using a known Listing. Payment is done in Coin<C>.
+    /// Purchase an item using a known Listing. Payment is done in Coin<SUI>.
     /// Amount paid must match the requested amount. If conditions are met,
     /// owner of the item gets the payment and buyer receives their item.
-    public fun buy<T: key + store, C>(
-        _marketplace: &mut Marketplace,
+    public fun buy<T: key + store>(
+        marketplace: &mut Marketplace,
         listing_id: ID,
-        paid: Coin<C>,
+        paid: Coin<SUI>,
         ctx: &mut TxContext
     ): T {
-        let listing = ofield::remove<ID, Listing<T, C>>(&mut _marketplace.id, listing_id);
+        nft_utils::assert_not_nft_protocol_type<T>();
 
-        // let typeName = & string::utf8(ascii::into_bytes(type_name::into_string(type_name::get<C>())));
-        // // last number can be 51? 32 for address, 4 for seperating colons, 12 for "nft_protocol", 3 for "Nft"
-        // let nftType = & string::sub_string(& string::utf8(ascii::into_bytes(type_name::into_string(type_name::get<Nft<Witness>>()))), 0, 51);
-        // // Returns `length(s)` if no occurrence found. We compare it to 0 because a standard NFT must start with the correct address::module::name
-        // assert!(string::index_of(typeName, nftType) > 0, EMustUseStandard);
-        // nft::change_logical_owner(&mut minted, recipient, KEEPSAKE {}, allowlist);
+        let listing = ofield::remove<ID, Listing<T>>(&mut marketplace.id, listing_id);
 
         let Listing { id, item, ask, owner } = listing;
         object::delete(id);
 
+        event::emit(DelistNftEvent {
+            nft_id: object::id(&item),
+            sale_price: ask,
+            sold: true,
+            type_name: type_name::get<T>(),
+        });
+
         let sent = coin::value(&paid);
         assert!(ask <= sent, EAmountIncorrect);
-        let marketFee = (ask * (_marketplace.fee as u64)) / 10000u64;
+        let marketFee = (ask * (marketplace.fee as u64)) / 10000u64;
 
         // take our share
-        let marketCoin = coin::split<C>(&mut paid, marketFee, ctx);
-        transfer::transfer(marketCoin, _marketplace.owner);
+        let marketCoin = coin::split<SUI>(&mut paid, marketFee, ctx);
+        coin::put(&mut marketplace.feeBalance, marketCoin);
         // if amount is exact, can skip splitting the amount
         if(sent > ask){
             transfer::transfer(coin::split(&mut paid, ask - marketFee, ctx), owner);
@@ -216,106 +269,261 @@ module nfts::marketplace_nofee {
     }
 
     /// Call [`buy`] and transfer item to the sender.
-    public entry fun buy_and_take<T: key + store, C>(
-        _marketplace: &mut Marketplace,
+    public entry fun buy_and_take<T: key + store>(
+        marketplace: &mut Marketplace,
         listing_id: ID,
-        paid: Coin<C>,
+        paid: Coin<SUI>,
         ctx: &mut TxContext
     ) {
-        transfer::transfer(buy<T,C>(_marketplace, listing_id, paid, ctx), tx_context::sender(ctx))
+        transfer::transfer(buy<T>(marketplace, listing_id, paid, ctx), tx_context::sender(ctx))
     }
 
-    public entry fun auction<T: key + store, C>(
-        _marketplace: &mut Marketplace,
-        item: T,
-        min_bid: u64,
-        starts: u64,
-        expires: u64,
+    public fun buy_standard<C>(
+        marketplace: &mut Marketplace,
+        listing_id: ID,
+        paid: Coin<SUI>,
+        allowlist: & Allowlist,
+        recipient: address,
+        ctx: &mut TxContext
+    ): Nft<C> {
+        let listing = ofield::remove<ID, Listing<Nft<C>>>(&mut marketplace.id, listing_id);
+
+        let Listing { id, item, ask, owner } = listing;
+        object::delete(id);
+
+        event::emit(DelistNftEvent {
+            nft_id: object::id(&item),
+            sale_price: ask,
+            sold: true,
+            type_name: type_name::get<Nft<C>>(),
+        });
+
+        let sent = coin::value(&paid);
+        assert!(ask <= sent, EAmountIncorrect);
+        let marketFee = (ask * (marketplace.fee as u64)) / 10000u64;
+
+        // take our share
+        let marketCoin = coin::split<SUI>(&mut paid, marketFee, ctx);
+        coin::put(&mut marketplace.feeBalance, marketCoin);
+        // if amount is exact, can skip splitting the amount
+        if(sent > ask){
+            transfer::transfer(coin::split(&mut paid, ask - marketFee, ctx), owner);
+            transfer::transfer(paid, tx_context::sender(ctx));
+        } else {
+            transfer::transfer(paid, owner);
+        };
+        nft::change_logical_owner(&mut item, recipient, Witness {}, allowlist);
+
+        item
+    }
+
+    public entry fun buy_standard_and_take<C>(
+        marketplace: &mut Marketplace,
+        listing_id: ID,
+        paid: Coin<SUI>,
+        allowlist: & Allowlist,
         ctx: &mut TxContext
     ) {
+        let nft = buy_standard<C>(marketplace, listing_id, paid, allowlist, tx_context::sender(ctx), ctx);
+        transfer::transfer(nft, tx_context::sender(ctx));
+    }
+
+    public entry fun auction<T: key + store>(
+        marketplace: &mut Marketplace,
+        item: T,
+        min_bid: u64,
+        min_bid_increment: u64,
+        starts: u64,
+        expires: u64,
+        collateral: Coin<SUI>,
+        ctx: &mut TxContext
+    ) {
+        let balance = coin::into_balance(coin::split<SUI>(&mut collateral, marketplace.collateralFee, ctx));
+        transfer::transfer(collateral, tx_context::sender(ctx));
+
         let id = object::new(ctx);
-        let listing = AuctionListing<T, C> {
+        let listing = AuctionListing<T> {
             id,
             item,
             min_bid,
-            bid: balance::zero<C>(),
+            bid: balance::zero<SUI>(),
+            collateral: balance,
+            min_bid_increment: min_bid_increment,
             starts,
             expires,
             owner: tx_context::sender(ctx),
             bidder: tx_context::sender(ctx),
         };
         let id = object::id(&listing); 
-        ofield::add(&mut _marketplace.id, id, listing);
+        ofield::add(&mut marketplace.id, id, listing);
     }
     
-    public entry fun bid<T: key + store, C>(
-        _marketplace: &mut Marketplace,
+    public entry fun bid<T: key + store>(
+        marketplace: &mut Marketplace,
         listing_id: ID,
-        paid: Coin<C>,
+        paid: Coin<SUI>,
         new_bid: u64,
         ctx: &mut TxContext
     ) {
 
-        let listing = ofield::borrow_mut<ID, AuctionListing<T, C>>(&mut _marketplace.id, listing_id);
-        let oldBid = sui::balance::value(&listing.bid);
-        // TODO: TESTNET ONLY. epoch on testnet seems to always return 0;
+        let listing = ofield::borrow_mut<ID, AuctionListing<T>>(&mut marketplace.id, listing_id);
+        let oldBid = balance::value(&listing.bid);
+        // TODO: DEVNET ONLY. epoch on devnet seems to always return 0;
         // assert!(listing.expires > tx_context::epoch(ctx), ETooLate);
         // assert!(listing.starts < tx_context::epoch(ctx), ETooEarly);
-        assert!(new_bid > oldBid, EAmountIncorrect);
+        assert!(new_bid > oldBid + listing.min_bid_increment, EAmountIncorrect);
         assert!(new_bid >= listing.min_bid, EAmountIncorrect);
 
         if(oldBid > 0){
-            transfer::transfer(sui::coin::take<C>(&mut listing.bid, oldBid, ctx), listing.bidder);
+            transfer::transfer(coin::take<SUI>(&mut listing.bid, oldBid, ctx), listing.bidder);
         };
-        let newCoin = coin::split<C>(&mut paid, new_bid, ctx);
-        coin::put<C>(&mut listing.bid, newCoin);
+        let newCoin = coin::split<SUI>(&mut paid, new_bid, ctx);
+        coin::put<SUI>(&mut listing.bid, newCoin);
         transfer::transfer(paid, tx_context::sender(ctx));
 
         listing.bidder =  tx_context::sender(ctx);
     }
 
-    public fun complete_auction<T: key + store, C>(
-        _marketplace: &mut Marketplace,
+    public fun complete_auction<T: key + store>(
+        marketplace: &mut Marketplace,
         listing_id: ID,
         ctx: &mut TxContext
-    ): T {
-        let listing = ofield::remove<ID, AuctionListing<T, C>>(&mut _marketplace.id, listing_id);
-        let AuctionListing { id, item, bid, owner, bidder, min_bid, starts: _, expires: _ } = listing;
-        assert!(bidder == tx_context::sender(ctx), ENotOwner);
-        let finalBid = sui::balance::value(&bid);
+    ): WonAuction<T> {
+        let listing = ofield::remove<ID, AuctionListing<T>>(&mut marketplace.id, listing_id);
+        let AuctionListing { id, item, bid, collateral, min_bid_increment: _, owner, bidder, min_bid, starts: _, expires: _ } = listing;
+        let finalBid = balance::value(&bid);
+        
+        nft_utils::assert_not_nft_protocol_type<T>();
+
+        event::emit(DelistNftEvent {
+            nft_id: object::id(&item),
+            sale_price: finalBid,
+            sold: true,
+            type_name: type_name::get<T>(),
+        });
 
         assert!(finalBid >= min_bid, ENoBid);
-        // TODO: TESTNET ONLY. epoch on testnet seems to always return 0;
+        // TODO: DEVNET ONLY. epoch on devnet seems to always return 0;
         //assert!(expires < tx_context::epoch(ctx), ETooEarly);
         //assert!(starts > tx_context::epoch(ctx), ETooLate);
+        
+        let fee = coin::from_balance(collateral, ctx);
+        let feeVal = coin::value(&fee);
+        if(feeVal > 0){
+            transfer::transfer(fee, owner);
+        } else {
+            coin::destroy_zero(fee);
+        };
 
-        let paid = sui::coin::from_balance<C>(bid, ctx);
-        let marketFee = (finalBid * (_marketplace.fee as u64)) / 10000u64;
-        transfer::transfer(coin::split(&mut paid, marketFee, ctx), _marketplace.owner);
+        let paid = coin::from_balance<SUI>(bid, ctx);
+        let marketFee = (finalBid * (marketplace.fee as u64)) / 10000u64;
+        let marketCoin = coin::split<SUI>(&mut paid, marketFee, ctx);
+        coin::put<SUI>(&mut marketplace.feeBalance, marketCoin);
         transfer::transfer(paid, owner);
         object::delete(id);
-        item
+        WonAuction{ item, bidder }
     }
 
-    public entry fun complete_auction_and_take<T: key + store, C>(
-        _marketplace: &mut Marketplace,
+    public entry fun complete_auction_and_take<T: key + store>(
+        marketplace: &mut Marketplace,
         listing_id: ID,
         ctx: &mut TxContext
     ) {
-        transfer::transfer(complete_auction<T, C>(_marketplace, listing_id, ctx), tx_context::sender(ctx));
+        let WonAuction<T> {item, bidder} = complete_auction(marketplace, listing_id, ctx);
+        transfer::transfer(item, bidder);
+    }
+
+    
+    public fun complete_auction_standard<C>(
+        marketplace: &mut Marketplace,
+        listing_id: ID,
+        allowlist: & Allowlist,
+        ctx: &mut TxContext
+    ): WonAuction<Nft<C>> {
+        let listing = ofield::remove<ID, AuctionListing<Nft<C>>>(&mut marketplace.id, listing_id);
+        let AuctionListing { id, item, bid, collateral, min_bid_increment: _, owner, bidder, min_bid, starts: _, expires: _ } = listing;
+        let finalBid = balance::value(&bid);
+
+        event::emit(DelistNftEvent {
+            nft_id: object::id(&item),
+            sale_price: finalBid,
+            sold: true,
+            type_name: type_name::get<Nft<C>>(),
+        });
+
+        assert!(finalBid >= min_bid, ENoBid);
+        // TODO: DEVNET ONLY. epoch on devnet seems to always return 0;
+        //assert!(expires < tx_context::epoch(ctx), ETooEarly);
+        //assert!(starts > tx_context::epoch(ctx), ETooLate);
+        
+        let fee = coin::from_balance(collateral, ctx);
+        let feeVal = coin::value(&fee);
+        if(feeVal > 0){
+            transfer::transfer(fee, owner);
+        } else {
+            coin::destroy_zero(fee);
+        };
+
+        let paid = coin::from_balance<SUI>(bid, ctx);
+        let marketFee = (finalBid * (marketplace.fee as u64)) / 10000u64;
+        let marketCoin = coin::split<SUI>(&mut paid, marketFee, ctx);
+        coin::put<SUI>(&mut marketplace.feeBalance, marketCoin);
+        transfer::transfer(paid, owner);
+        object::delete(id);
+        nft::change_logical_owner(&mut item, bidder, Witness {}, allowlist);
+        WonAuction<Nft<C>>{ item, bidder }
     }
 
 
+    public entry fun complete_auction_and_take_standard<C>(
+        marketplace: &mut Marketplace,
+        listing_id: ID,
+        allowlist: & Allowlist,
+        ctx: &mut TxContext
+    ) {
+        let WonAuction<Nft<C>> {item, bidder} = complete_auction_standard<C>(marketplace, listing_id, allowlist, ctx);
+        transfer::transfer(item, bidder);
+    }
+
+
+
+
     /// Remove listing and get an item back. Only owner can do that.
-    public fun deauction<T: key + store, C>(
-        _marketplace: &mut Marketplace,
-        listing: AuctionListing<T,C>,
+    public fun deauction<T: key + store>(
+        marketplace: &mut Marketplace,
+        listing: AuctionListing<T>,
         ctx: &mut TxContext
     ): T {
-        let AuctionListing { id, item, bid, bidder, expires: _, starts: _, min_bid: _, owner } = listing;
+        let AuctionListing { id, item, bid, bidder, min_bid_increment: _, expires: _, starts: _, min_bid: _, collateral, owner } = listing;
+        
+        event::emit(DelistNftEvent {
+            nft_id: object::id(&item),
+            sale_price: 0,
+            sold: false,
+            type_name: type_name::get<T>(),
+        });
 
-        let paid = sui::coin::from_balance<C>(bid, ctx);
-        transfer::transfer(paid, bidder);
+        let fee = coin::from_balance(collateral, ctx);
+        let feeVal = coin::value(&fee);
+        let paid = coin::from_balance<SUI>(bid, ctx);
+        let paidVal = coin::value(&paid);
+
+        if(feeVal > 0){
+            // Take the fee, divide it among market owner, and bidder
+            if(paidVal > 0){
+                transfer::transfer(coin::split(&mut fee, feeVal / 2, ctx), marketplace.owner);
+            };
+            transfer::transfer(fee, bidder);
+        } else {
+            coin::destroy_zero(fee);
+        };
+
+        if(paidVal > 0){
+            transfer::transfer(paid, bidder);
+        } else {
+            coin::destroy_zero(paid);
+        };
+
         assert!(tx_context::sender(ctx) == owner, ENotOwner);
         // assert!(expires > tx_context::epoch(ctx) || expires == 0, ETooEarly);
         object::delete(id);
@@ -323,46 +531,19 @@ module nfts::marketplace_nofee {
     }
 
     /// Call [`delist`] and transfer item to the sender.
-    public entry fun deauction_and_take<T: key + store, C>(
-        _marketplace: &mut Marketplace,
+    public entry fun deauction_and_take<T: key + store>(
+        marketplace: &mut Marketplace,
         listing_id: ID,
         ctx: &mut TxContext
     ) {
-        let listing = ofield::remove<ID, AuctionListing<T, C>>(&mut _marketplace.id, listing_id);
-        let item = deauction(_marketplace, listing, ctx);
+        let listing = ofield::remove<ID, AuctionListing<T>>(&mut marketplace.id, listing_id);
+        let item = deauction(marketplace, listing, ctx);
         transfer::transfer(item, tx_context::sender(ctx));
     }
 
-    // public entry fun createLaunchpad<T>(
-    //     market: & Marketplace,
-    //     collection_id: ID,
-    //     type: u8,
-    //     prices: vector<u64>,
-    //     whitelist: vector<bool>,
-    //     receiver: address,
-    //     ctx: &mut TxContext
-    // ) {
-    //     assert!(tx_context::sender(ctx) == market.owner, ENotOwner);
-    //     if(type == 0) {
-    //         fixed_price::create_market<T>(
-    //             tx_context::sender(ctx), // admin
-    //             collection_id,
-    //             receiver, // receiver
-    //             true, // is_embedded
-    //             whitelist, prices,
-    //             ctx,
-    //         );
-    //     } else {
-    //         dutch_auction::create_market<T>(
-    //             tx_context::sender(ctx), // admin
-    //             collection_id,
-    //             receiver, // receiver
-    //             true, // is_embedded
-    //             whitelist, prices,
-    //             ctx,
-    //         );
-    //     }
-    // }
+    public(friend) fun getWitness(): Witness {
+        Witness {}
+    }
 
     // getter functions for contracts to get info about our marketplace.
     public fun owner(
@@ -376,89 +557,11 @@ module nfts::marketplace_nofee {
     ): u16 {
         market.fee
     }
-}
 
-#[test_only]
-module nfts::marketplaceTests {
-    // use std::debug;
-    use sui::object::{Self, UID};
-    use sui::transfer;
-    use sui::coin::{Self, Coin};
-    use sui::sui::SUI;
-    use sui::test_scenario::{Self, Scenario};
-    // use nfts::bag::{Self, Bag};
-    use nfts::marketplace_nofee::{Self, Marketplace/*, Listing*/};
-
-    struct Kitty has key, store {
-        id: UID,
-        kitty_id: u8
+    public fun collateralFee(
+        market: &Marketplace,
+    ): u64 {
+        market.collateralFee
     }
 
-    fun burn_kitty(kitty: Kitty): u8 {
-        let Kitty{ id, kitty_id } = kitty;
-        object::delete(id);
-        kitty_id
-    }
-
-    const ADMIN: address = @0xA55;
-    const SELLER: address = @0x00A;
-    const BUYER: address = @0x00B;
-
-    fun create_marketplace(scenario: &mut Scenario) {
-        test_scenario::next_tx(scenario, ADMIN);
-        marketplace_nofee::create(ADMIN, 250, test_scenario::ctx(scenario));
-    }
-    fun mint_some_coin(scenario: &mut Scenario) {
-        test_scenario::next_tx(scenario, ADMIN);
-        let coin = coin::mint_for_testing<SUI>(1000, test_scenario::ctx(scenario));
-        transfer::transfer(coin, BUYER);
-    }
-
-    fun mint_kitty(scenario: &mut Scenario) {
-        test_scenario::next_tx(scenario, ADMIN);
-        let nft = Kitty { id: object::new(test_scenario::ctx(scenario)), kitty_id: 1 };
-        transfer::transfer(nft, SELLER);
-    }
-
-
-    #[test]
-    fun buy_kitty() {
-        let scenario_val = test_scenario::begin(ADMIN);
-        let scenario = &mut scenario_val;
-        
-        create_marketplace(scenario);
-        mint_some_coin(scenario);
-        mint_kitty(scenario);
-        
-        let mkp_val = test_scenario::take_shared<Marketplace>(scenario);
-        let mkp = &mut mkp_val;
-
-        
-        test_scenario::next_tx(scenario, SELLER);
-        let nft = test_scenario::take_from_sender<Kitty>(scenario);
-        let listingID = marketplace_nofee::sclist<Kitty, SUI>(mkp, nft, 100, test_scenario::ctx(scenario));
-    
-
-        // BUYER takes 100 SUI from his wallet and purchases Kitty.
-        test_scenario::next_tx(scenario, BUYER);
-
-        let coin = test_scenario::take_from_sender<Coin<SUI>>(scenario);
-
-
-        // let listing = test_scenario::take_from_address<Listing<Kitty, SUI>>(scenario, object::id_to_address(&object::id(mkp)));
-        
-        let payment = coin::take(coin::balance_mut(&mut coin), 100, test_scenario::ctx(scenario));
-
-
-        // // Do the buy call and expect successful purchase.
-        marketplace_nofee::buy_and_take<Kitty, SUI>(mkp, listingID, payment, test_scenario::ctx(scenario));
-
-        // 
-        // 
-        // test_scenario::return_to_sender(scenario, listing);
-        test_scenario::return_shared(mkp_val);
-        test_scenario::return_to_sender(scenario, coin);
-
-        test_scenario::end(scenario_val);
-    }
 }
