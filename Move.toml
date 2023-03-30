@@ -1,17 +1,17 @@
 [package]
-name = "NFTs"
-version = "0.0.1"
+name = "Keepsake"
+version = "0.1.0"
 
 [dependencies.Sui]
 git = "https://github.com/MystenLabs/sui.git"
-subdir = "crates/sui-framework"
+subdir = "crates/sui-framework/packages/sui-framework"
 # devnet-0.16.0
-rev = "devnet"
+rev = "82c9c80c11488858f1d3930f47ec9f335a566683"
 
 
 [dependencies.NftProtocol]
 git = "https://github.com/Origin-Byte/nft-protocol.git"
-rev="https://github.com/Origin-Byte/nft-protocol"
+rev="47c70bc316292c05678d57f55ff3b3231572f7c4"
 
 [addresses]
-nfts = "0x0"
+keepsake = "0x4ddf6c438d64833a98bec88288cd5cbb76149ea666f02f7afcb73ab6b0e86a85"
